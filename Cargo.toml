@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+ctrlc = "3.5.2"
+libc = "0.2.186"
+sysinfo = "0.38.4"
