@@ -36,14 +36,47 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       
+      - name: Install Npcap SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile npcap-sdk.zip
+          Expand-Archive -Path npcap-sdk.zip -DestinationPath npcap-sdk
+          echo "LIB=${{ github.workspace }}\npcap-sdk\Lib\x64" >> $env:GITHUB_ENV
+
+      - name: Install Npcap (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-1.80.exe" -OutFile npcap.exe
+          Start-Process -FilePath .\npcap.exe -ArgumentList '/S' -Wait
+      
       - name: Check formatting
         run: cargo fmt --all -- --check
       
-      - name: Clippy
+      - name: Clippy (Linux)
+        if: runner.os == 'Linux'
         run: cargo clippy --all-targets --all-features -- -D warnings
       
-      - name: Run tests
+      - name: Clippy (Windows)
+        if: runner.os == 'Windows'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      
+      - name: Clippy (macOS)
+        if: runner.os == 'macOS'
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+      
+      - name: Run tests (Linux)
+        if: runner.os == 'Linux'
         run: cargo test --verbose
+      
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --verbose
+      
+      - name: Run tests (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --verbose --no-default-features
       
       - name: Build
         run: cargo build --release --verbose

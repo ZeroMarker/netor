@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::collections::HashMap;
 use std::error::Error;
@@ -272,12 +274,106 @@ fn capture_web_events(
     Ok(events)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(windows, feature = "npcap"))]
+fn capture_web_events(
+    duration: Duration,
+    interface: Option<&str>,
+) -> Result<Vec<WebEvent>, Box<dyn Error>> {
+    let device = select_pcap_device(interface)?;
+    let mut cap = pcap::Capture::from_device(device)
+        .map_err(|e| format!("pcap: {e}"))?
+        .promisc(true)
+        .snaplen(65_536)
+        .timeout(200)
+        .immediate_mode(true)
+        .open()
+        .map_err(|e| format!("pcap open: {e}"))?;
+
+    let deadline = Instant::now() + duration;
+    let mut events = Vec::new();
+
+    while Instant::now() < deadline {
+        match cap.next_packet() {
+            Ok(packet) => {
+                events.extend(parse_packet_for_web_events(packet.data));
+            }
+            Err(pcap::Error::TimeoutExpired) => continue,
+            Err(e) => return Err(format!("pcap: {e}").into()),
+        }
+    }
+
+    Ok(events)
+}
+
+#[cfg(all(windows, feature = "npcap"))]
+fn select_pcap_device(interface: Option<&str>) -> Result<pcap::Device, Box<dyn Error>> {
+    let devices = pcap::Device::list().map_err(|e| format!("pcap device list: {e}"))?;
+
+    if let Some(filter) = interface {
+        let filter_lower = filter.to_lowercase();
+        devices
+            .into_iter()
+            .find(|d| {
+                d.name.to_lowercase().contains(&filter_lower)
+                    || d.desc
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&filter_lower)
+            })
+            .ok_or_else(|| format!("no network interface matching '{filter}'").into())
+    } else {
+        select_default_device(devices)
+    }
+}
+
+#[cfg(all(windows, feature = "npcap"))]
+fn select_default_device(devices: Vec<pcap::Device>) -> Result<pcap::Device, Box<dyn Error>> {
+    let skip_keywords = [
+        "wan miniport",
+        "loopback",
+        "tunnel",
+        "teredo",
+        "isatap",
+        "bluetooth",
+    ];
+    let prefer_keywords = [
+        "ethernet", "wi-fi", "wireless", "realtek", "intel", "qualcomm",
+    ];
+
+    if let Some(device) = devices.iter().find(|d| {
+        let desc = d.desc.as_deref().unwrap_or("").to_lowercase();
+        prefer_keywords.iter().any(|kw| desc.contains(kw))
+            && !skip_keywords.iter().any(|kw| desc.contains(kw))
+    }) {
+        return Ok(device.clone());
+    }
+
+    if let Some(device) = devices.iter().find(|d| {
+        let desc = d.desc.as_deref().unwrap_or("").to_lowercase();
+        !skip_keywords.iter().any(|kw| desc.contains(kw)) && !d.addresses.is_empty()
+    }) {
+        return Ok(device.clone());
+    }
+
+    pcap::Device::lookup()
+        .map_err(|e| format!("pcap device lookup: {e}"))?
+        .ok_or("no default network interface found".into())
+}
+
+#[cfg(not(any(target_os = "linux", all(windows, feature = "npcap"))))]
 fn capture_web_events(
     _duration: Duration,
     _interface: Option<&str>,
 ) -> Result<Vec<WebEvent>, Box<dyn Error>> {
-    Err("protocol packet capture is currently implemented for Linux raw sockets; Windows needs an Npcap backend".into())
+    #[cfg(windows)]
+    {
+        Err("packet capture requires the 'npcap' feature and Npcap installed; rebuild with --features npcap".into())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("packet capture is not yet supported on this platform".into())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -708,19 +804,17 @@ fn parse_tcp_for_web_events(packet: &[u8]) -> Vec<WebEvent> {
     let payload = &packet[header_len..];
     let mut events = Vec::new();
 
-    if source_port == 53 || destination_port == 53 {
-        if payload.len() >= 2 {
-            let dns_len = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
-            if payload.len() >= dns_len + 2 {
-                events.extend(
-                    parse_dns_query_domains(&payload[2..2 + dns_len])
-                        .into_iter()
-                        .map(|domain| WebEvent {
-                            source: "dns",
-                            domain,
-                        }),
-                );
-            }
+    if (source_port == 53 || destination_port == 53) && payload.len() >= 2 {
+        let dns_len = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+        if payload.len() >= dns_len + 2 {
+            events.extend(
+                parse_dns_query_domains(&payload[2..2 + dns_len])
+                    .into_iter()
+                    .map(|domain| WebEvent {
+                        source: "dns",
+                        domain,
+                    }),
+            );
         }
     }
 
@@ -1029,7 +1123,7 @@ fn truncate(value: &str, width: usize) -> String {
     let mut chars = value.chars();
     let truncated = chars.by_ref().take(width).collect::<String>();
 
-    if chars.next().is_some() && width >= 1 {
+    if chars.next().is_some() && width >= 4 {
         format!(
             "{}...",
             truncated
@@ -1120,6 +1214,206 @@ mod tests {
     fn reads_three_byte_lengths() {
         assert_eq!(read_u24(&[0x00, 0x10, 0x00]), Some(4096));
         assert_eq!(read_u24(&[0x10, 0x00]), None);
+    }
+
+    #[test]
+    fn trims_trailing_zeros_from_float() {
+        assert_eq!(trim_float(1.0), "1");
+        assert_eq!(trim_float(1.500), "1.5");
+        assert_eq!(trim_float(0.123), "0.123");
+        assert_eq!(trim_float(2.001), "2.001");
+    }
+
+    #[test]
+    fn formats_bits_with_binary_units() {
+        assert_eq!(format_bits(0.0), "0 b");
+        assert_eq!(format_bits(1024.0), "1.00 Kib");
+        assert_eq!(format_bits(1024.0 * 1024.0), "1.00 Mib");
+    }
+
+    #[test]
+    fn formats_rate_in_bytes_and_bits() {
+        assert_eq!(format_rate(1024.0, Unit::Bytes), "1.00 KiB/s");
+        assert_eq!(format_rate(1024.0, Unit::Bits), "8.00 Kib/s");
+        assert_eq!(format_rate(1024.0, Unit::Auto), "1.00 KiB/s");
+    }
+
+    #[test]
+    fn truncates_long_interface_names() {
+        assert_eq!(truncate("abcdefghijklmnopqrs", 18), "abcdefghijklmno...");
+        assert_eq!(truncate("short", 18), "short");
+        assert_eq!(truncate("exact18chars------", 18), "exact18chars------");
+        assert_eq!(truncate("", 10), "");
+        assert_eq!(truncate("abc", 1), "a");
+        assert_eq!(truncate("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn sorts_counts_by_frequency() {
+        let mut counts = HashMap::new();
+        counts.insert("a".to_owned(), 3);
+        counts.insert("b".to_owned(), 1);
+        counts.insert("c".to_owned(), 5);
+        let sorted = sorted_counts(&counts);
+        assert_eq!(sorted[0], ("c".to_owned(), 5));
+        assert_eq!(sorted[1], ("a".to_owned(), 3));
+        assert_eq!(sorted[2], ("b".to_owned(), 1));
+    }
+
+    #[test]
+    fn maps_tcp_state_hex_codes() {
+        assert_eq!(tcp_state_name("01"), "ESTABLISHED");
+        assert_eq!(tcp_state_name("02"), "SYN_SENT");
+        assert_eq!(tcp_state_name("06"), "TIME_WAIT");
+        assert_eq!(tcp_state_name("0A"), "LISTEN");
+        assert_eq!(tcp_state_name("FF"), "UNKNOWN");
+    }
+
+    #[test]
+    fn validates_positive_f64_edge_cases() {
+        assert!(positive_f64("inf").is_err());
+        assert!(positive_f64("-inf").is_err());
+        assert_eq!(positive_f64("1"), Ok(1.0));
+        assert_eq!(positive_f64("0.001"), Ok(0.001));
+    }
+
+    #[test]
+    fn rejects_invalid_endpoints() {
+        assert_eq!(parse_endpoint("not-an-endpoint"), None);
+        assert_eq!(parse_endpoint(""), None);
+        assert_eq!(parse_endpoint("192.168.1.1"), None);
+    }
+
+    #[test]
+    fn formats_large_byte_values() {
+        assert_eq!(format_bytes(1024.0 * 1024.0), "1.00 MiB");
+        assert_eq!(format_bytes(1024.0 * 1024.0 * 1024.0), "1.00 GiB");
+        assert_eq!(format_bytes(1024.0 * 1024.0 * 1024.0 * 1024.0), "1.00 TiB");
+    }
+
+    #[test]
+    fn rejects_non_positive_usize() {
+        assert!(positive_usize("0").is_err());
+        assert!(positive_usize("-5").is_err());
+        assert_eq!(positive_usize("100"), Ok(100));
+    }
+
+    #[test]
+    fn parses_dns_response_ignored() {
+        let packet = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
+        ];
+        assert_eq!(parse_dns_query_domains(&packet), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parses_dns_short_packet_returns_empty() {
+        assert_eq!(parse_dns_query_domains(&[0u8; 5]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn rejects_non_tls_packets() {
+        assert_eq!(parse_tls_sni(&[0u8; 5]), None);
+        assert_eq!(parse_tls_sni(&[22, 3, 1, 0, 5, 99]), None);
+    }
+
+    #[test]
+    fn rejects_short_tls_sni_extension() {
+        assert_eq!(parse_tls_sni_extension(&[0x00]), None);
+        assert_eq!(parse_tls_sni_extension(&[]), None);
+    }
+
+    #[test]
+    fn extracts_ethernet_ipv4_payload() {
+        let mut packet = vec![0u8; 34];
+        packet[12] = 0x08;
+        packet[13] = 0x00;
+        packet[14] = 0x45;
+        assert!(ethernet_payload(&packet).is_some());
+    }
+
+    #[test]
+    fn rejects_short_ethernet_frame() {
+        assert_eq!(ethernet_payload(&[0u8; 10]), None);
+    }
+
+    #[test]
+    fn rejects_non_ip_ethertype() {
+        let mut packet = vec![0u8; 20];
+        packet[12] = 0x00;
+        packet[13] = 0x01;
+        assert_eq!(ethernet_payload(&packet), None);
+    }
+
+    #[test]
+    fn parses_vlan_tagged_frame() {
+        let mut packet = vec![0u8; 38];
+        packet[12] = 0x81;
+        packet[13] = 0x00;
+        packet[16] = 0x08;
+        packet[17] = 0x00;
+        packet[18] = 0x45;
+        assert!(ethernet_payload(&packet).is_some());
+    }
+
+    #[test]
+    fn rejects_short_ipv4_packet() {
+        assert_eq!(
+            parse_ipv4_for_web_events(&[0u8; 10]),
+            Vec::<WebEvent>::new()
+        );
+    }
+
+    #[test]
+    fn rejects_short_ipv6_packet() {
+        assert_eq!(
+            parse_ipv6_for_web_events(&[0u8; 20]),
+            Vec::<WebEvent>::new()
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_ip_version() {
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x90;
+        assert_eq!(
+            parse_ip_payload_for_web_events(&packet),
+            Vec::<WebEvent>::new()
+        );
+    }
+
+    #[test]
+    fn rejects_empty_ip_payload() {
+        assert_eq!(parse_ip_payload_for_web_events(&[]), Vec::<WebEvent>::new());
+    }
+
+    #[test]
+    fn rejects_short_tcp_packet() {
+        assert_eq!(parse_tcp_for_web_events(&[0u8; 10]), Vec::<WebEvent>::new());
+    }
+
+    #[test]
+    fn rejects_short_udp_packet() {
+        assert_eq!(parse_udp_for_web_events(&[0u8; 4]), Vec::<WebEvent>::new());
+    }
+
+    #[test]
+    fn parses_dns_name_with_pointer() {
+        let mut packet = vec![0u8; 64];
+        packet[0] = 3;
+        packet[1] = b'w';
+        packet[2] = b'w';
+        packet[3] = b'w';
+        packet[4] = 0;
+        let (name, _) = parse_dns_name(&packet, 0).unwrap();
+        assert_eq!(name, "www");
+    }
+
+    #[test]
+    fn rejects_dns_name_beyond_packet() {
+        assert_eq!(parse_dns_name(&[0x05], 0), None);
     }
 
     #[cfg(target_os = "linux")]

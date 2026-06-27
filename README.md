@@ -13,7 +13,7 @@ statistics. It only uses information available from the operating system:
 
 - Cross-platform interface traffic statistics through `sysinfo`
 - Live remote TCP endpoint monitoring without browser or server logs
-- Real-time DNS and TLS SNI domain capture on Linux raw sockets
+- Real-time DNS and TLS SNI domain capture (Linux raw sockets, Windows Npcap)
 - Receive/transmit rates and totals per network interface
 - TCP remote IP, port, and connection state snapshots
 - Continuous monitoring or one-shot output
@@ -59,13 +59,19 @@ cargo run -- live --once --all-states
 Capture website domain events from DNS and TLS SNI packets:
 
 ```bash
+# Linux (requires root or CAP_NET_RAW)
 sudo cargo run -- web --once
 sudo cargo run -- web --interface eth0 --interval 5
+
+# Windows (requires Npcap installed)
+cargo run -- web --once
+cargo run -- web --interface "Ethernet" --interval 5
 ```
 
 `web` does not read browser history or server logs. It captures packets from the
 network interface and parses protocol metadata. On Linux this uses raw sockets
-and usually requires root or `CAP_NET_RAW`.
+and usually requires root or `CAP_NET_RAW`. On Windows this uses
+[Npcap](https://npcap.com/) which must be installed separately.
 
 ## Limits
 
@@ -85,6 +91,14 @@ capture started.
 
 ```bash
 cargo build --release
+```
+
+On Windows, building with the default `npcap` feature requires the
+[Npcap SDK](https://npcap.com/#download). Extract it and add the `Lib/x64`
+directory to your `LIB` environment variable. To build without Npcap support:
+
+```bash
+cargo build --release --no-default-features
 ```
 
 The release binary is written to `target/release/netor`.

@@ -3,8 +3,17 @@ name = "netor"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["npcap"]
+npcap = ["dep:pcap"]
+
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 ctrlc = "3.5.2"
-libc = "0.2.186"
 sysinfo = "0.38.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.186"
+
+[target.'cfg(windows)'.dependencies]
+pcap = { version = "2.4", optional = true }
