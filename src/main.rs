@@ -6,6 +6,8 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command as ProcessCommand;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -113,8 +115,8 @@ struct InterfaceRow {
     tx_rate: f64,
     rx_total: u64,
     tx_total: u64,
-    packets_rx: u64,
-    packets_tx: u64,
+    packets_rx: f64,
+    packets_tx: f64,
     errors_rx: u64,
     errors_tx: u64,
 }
@@ -158,11 +160,17 @@ fn run_network(cli: NetworkArgs) -> Result<(), Box<dyn Error>> {
         cli.interface.as_deref().unwrap_or("*")
     );
 
+    let mut sampled_at = Instant::now();
     loop {
-        thread::sleep(interval);
+        if !wait_for_interval(interval, &running) {
+            break;
+        }
         networks.refresh(true);
+        let now = Instant::now();
+        let elapsed_secs = now.duration_since(sampled_at).as_secs_f64();
+        sampled_at = now;
 
-        let rows = collect_interface_rows(&networks, &cli, interval.as_secs_f64());
+        let rows = collect_interface_rows(&networks, &cli, elapsed_secs);
         print_interface_rows(&rows, cli.unit);
 
         if cli.once || !running.load(Ordering::SeqCst) {
@@ -192,7 +200,9 @@ fn run_live(cli: LiveArgs) -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        thread::sleep(interval);
+        if !wait_for_interval(interval, &running) {
+            break;
+        }
     }
 
     Ok(())
@@ -212,7 +222,7 @@ fn run_web(cli: WebArgs) -> Result<(), Box<dyn Error>> {
     );
 
     loop {
-        let events = capture_web_events(interval, cli.interface.as_deref())?;
+        let events = capture_web_events(interval, cli.interface.as_deref(), &running)?;
         print_web_events(&events, cli.top);
 
         if cli.once || !running.load(Ordering::SeqCst) {
@@ -226,8 +236,25 @@ fn run_web(cli: WebArgs) -> Result<(), Box<dyn Error>> {
 fn install_ctrlc_handler() -> Result<Arc<AtomicBool>, Box<dyn Error>> {
     let running = Arc::new(AtomicBool::new(true));
     let handler_flag = Arc::clone(&running);
-    ctrlc::set_handler(move || handler_flag.store(false, Ordering::SeqCst))?;
+    let monitor_thread = thread::current();
+    ctrlc::set_handler(move || {
+        handler_flag.store(false, Ordering::SeqCst);
+        monitor_thread.unpark();
+    })?;
     Ok(running)
+}
+
+// Recheck the flag after wakeups: park_timeout may return spuriously.
+fn wait_for_interval(interval: Duration, running: &AtomicBool) -> bool {
+    let started = Instant::now();
+    while running.load(Ordering::SeqCst) {
+        let remaining = interval.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::park_timeout(remaining);
+    }
+    false
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,14 +267,22 @@ struct WebEvent {
 fn capture_web_events(
     duration: Duration,
     interface: Option<&str>,
+    running: &AtomicBool,
 ) -> Result<Vec<WebEvent>, Box<dyn Error>> {
     let socket = open_packet_socket(interface)?;
-    let deadline = Instant::now() + duration;
+    let started = Instant::now();
     let mut buffer = vec![0_u8; 65_536];
     let mut events = Vec::new();
 
-    while Instant::now() < deadline {
-        let read = unsafe { libc::recv(socket, buffer.as_mut_ptr().cast(), buffer.len(), 0) };
+    while running.load(Ordering::SeqCst) && started.elapsed() < duration {
+        let read = unsafe {
+            libc::recv(
+                socket.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+            )
+        };
 
         if read > 0 {
             events.extend(parse_packet_for_web_events(&buffer[..read as usize]));
@@ -257,20 +292,16 @@ fn capture_web_events(
         let error = std::io::Error::last_os_error();
         if matches!(
             error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::Interrupted
         ) {
             continue;
         }
 
-        unsafe {
-            libc::close(socket);
-        }
         return Err(error.into());
     }
 
-    unsafe {
-        libc::close(socket);
-    }
     Ok(events)
 }
 
@@ -278,6 +309,7 @@ fn capture_web_events(
 fn capture_web_events(
     duration: Duration,
     interface: Option<&str>,
+    running: &AtomicBool,
 ) -> Result<Vec<WebEvent>, Box<dyn Error>> {
     let device = select_pcap_device(interface)?;
     let mut cap = pcap::Capture::from_device(device)
@@ -289,10 +321,10 @@ fn capture_web_events(
         .open()
         .map_err(|e| format!("pcap open: {e}"))?;
 
-    let deadline = Instant::now() + duration;
+    let started = Instant::now();
     let mut events = Vec::new();
 
-    while Instant::now() < deadline {
+    while running.load(Ordering::SeqCst) && started.elapsed() < duration {
         match cap.next_packet() {
             Ok(packet) => {
                 events.extend(parse_packet_for_web_events(packet.data));
@@ -365,6 +397,7 @@ fn select_default_device(devices: Vec<pcap::Device>) -> Result<pcap::Device, Box
 fn capture_web_events(
     _duration: Duration,
     _interface: Option<&str>,
+    _running: &AtomicBool,
 ) -> Result<Vec<WebEvent>, Box<dyn Error>> {
     #[cfg(windows)]
     {
@@ -377,12 +410,15 @@ fn capture_web_events(
 }
 
 #[cfg(target_os = "linux")]
-fn open_packet_socket(interface: Option<&str>) -> Result<libc::c_int, Box<dyn Error>> {
+fn open_packet_socket(interface: Option<&str>) -> Result<OwnedFd, Box<dyn Error>> {
     let protocol = (libc::ETH_P_ALL as u16).to_be() as i32;
     let socket = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, protocol) };
     if socket < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+
+    // Own the descriptor immediately so every error path closes it.
+    let socket = unsafe { OwnedFd::from_raw_fd(socket) };
 
     let timeout = libc::timeval {
         tv_sec: 0,
@@ -390,7 +426,7 @@ fn open_packet_socket(interface: Option<&str>) -> Result<libc::c_int, Box<dyn Er
     };
     let set_timeout = unsafe {
         libc::setsockopt(
-            socket,
+            socket.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_RCVTIMEO,
             (&timeout as *const libc::timeval).cast(),
@@ -399,14 +435,11 @@ fn open_packet_socket(interface: Option<&str>) -> Result<libc::c_int, Box<dyn Er
     };
     if set_timeout < 0 {
         let error = std::io::Error::last_os_error();
-        unsafe {
-            libc::close(socket);
-        }
         return Err(error.into());
     }
 
     if let Some(interface) = interface {
-        bind_packet_socket(socket, interface)?;
+        bind_packet_socket(socket.as_raw_fd(), interface)?;
     }
 
     Ok(socket)
@@ -418,9 +451,6 @@ fn bind_packet_socket(socket: libc::c_int, interface: &str) -> Result<(), Box<dy
     let index = unsafe { libc::if_nametoindex(c_interface.as_ptr()) };
     if index == 0 {
         let error = std::io::Error::last_os_error();
-        unsafe {
-            libc::close(socket);
-        }
         return Err(error.into());
     }
 
@@ -443,9 +473,6 @@ fn bind_packet_socket(socket: libc::c_int, interface: &str) -> Result<(), Box<dy
     };
     if result < 0 {
         let error = std::io::Error::last_os_error();
-        unsafe {
-            libc::close(socket);
-        }
         return Err(error.into());
     }
 
@@ -509,8 +536,8 @@ fn interface_row_from_network(name: &str, data: &NetworkData, elapsed_secs: f64)
         tx_rate: data.transmitted() as f64 / elapsed_secs,
         rx_total: data.total_received(),
         tx_total: data.total_transmitted(),
-        packets_rx: data.packets_received(),
-        packets_tx: data.packets_transmitted(),
+        packets_rx: data.packets_received() as f64 / elapsed_secs,
+        packets_tx: data.packets_transmitted() as f64 / elapsed_secs,
         errors_rx: data.errors_on_received(),
         errors_tx: data.errors_on_transmitted(),
     }
@@ -1039,20 +1066,20 @@ fn print_interface_rows(rows: &[InterfaceRow], unit: Unit) {
             format_rate(row.tx_rate, unit),
             format_bytes(row.rx_total as f64),
             format_bytes(row.tx_total as f64),
-            row.packets_rx,
-            row.packets_tx,
+            format!("{:.1}", row.packets_rx),
+            format!("{:.1}", row.packets_tx),
             format!("{}/{}", row.errors_rx, row.errors_tx),
         );
     }
 }
 
-fn sorted_counts(values: &HashMap<String, u64>) -> Vec<(String, u64)> {
+fn sorted_counts(values: &HashMap<String, u64>) -> Vec<(&str, u64)> {
     let mut rows = values
         .iter()
-        .map(|(value, count)| (value.clone(), *count))
+        .map(|(value, count)| (value.as_str(), *count))
         .collect::<Vec<_>>();
 
-    rows.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    rows.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
     rows
 }
 
@@ -1061,10 +1088,13 @@ fn positive_f64(value: &str) -> Result<f64, String> {
         .parse::<f64>()
         .map_err(|_| format!("`{value}` is not a number"))?;
 
-    if parsed.is_finite() && parsed > 0.0 {
+    if parsed.is_finite()
+        && parsed > 0.0
+        && Duration::try_from_secs_f64(parsed).is_ok_and(|duration| !duration.is_zero())
+    {
         Ok(parsed)
     } else {
-        Err("value must be greater than 0".to_owned())
+        Err("value must be a positive, representable duration (at least 1 ns)".to_owned())
     }
 }
 
@@ -1146,6 +1176,28 @@ mod tests {
         assert!(positive_f64("0").is_err());
         assert!(positive_f64("-1").is_err());
         assert!(positive_f64("nan").is_err());
+    }
+
+    #[test]
+    fn rejects_unrepresentable_intervals() {
+        for value in ["1e300", "1e-300", "0.0000000001"] {
+            assert!(positive_f64(value).is_err(), "accepted {value}");
+            assert!(Cli::try_parse_from(["netor", "--interval", value]).is_err());
+        }
+        assert_eq!(positive_f64("0.000000001"), Ok(1e-9));
+    }
+
+    #[test]
+    fn interval_wait_handles_cancellation_and_spurious_wakeups() {
+        let running = AtomicBool::new(false);
+        assert!(!wait_for_interval(Duration::from_secs(60), &running));
+
+        running.store(true, Ordering::SeqCst);
+        thread::current().unpark();
+        let started = Instant::now();
+        let interval = Duration::from_millis(10);
+        assert!(wait_for_interval(interval, &running));
+        assert!(started.elapsed() >= interval);
     }
 
     #[test]
@@ -1255,9 +1307,9 @@ mod tests {
         counts.insert("b".to_owned(), 1);
         counts.insert("c".to_owned(), 5);
         let sorted = sorted_counts(&counts);
-        assert_eq!(sorted[0], ("c".to_owned(), 5));
-        assert_eq!(sorted[1], ("a".to_owned(), 3));
-        assert_eq!(sorted[2], ("b".to_owned(), 1));
+        assert_eq!(sorted[0], ("c", 5));
+        assert_eq!(sorted[1], ("a", 3));
+        assert_eq!(sorted[2], ("b", 1));
     }
 
     #[test]

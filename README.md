@@ -14,7 +14,8 @@ statistics. It only uses information available from the operating system:
 - Cross-platform interface traffic statistics through `sysinfo`
 - Live remote TCP endpoint monitoring without browser or server logs
 - Real-time DNS and TLS SNI domain capture (Linux raw sockets, Windows Npcap)
-- Receive/transmit rates and totals per network interface
+- Receive/transmit byte and packet rates based on actual elapsed sampling time
+- Traffic totals per network interface
 - TCP remote IP, port, and connection state snapshots
 - Continuous monitoring or one-shot output
 
@@ -72,6 +73,10 @@ cargo run -- web --interface "Ethernet" --interval 5
 network interface and parses protocol metadata. On Linux this uses raw sockets
 and usually requires root or `CAP_NET_RAW`. On Windows this uses
 [Npcap](https://npcap.com/) which must be installed separately.
+
+Intervals must be positive and representable with nanosecond precision.
+Press Ctrl+C to interrupt monitoring waits; packet capture checks for shutdown
+between packet reads (normally within the 200 ms capture timeout).
 
 ## Limits
 
