@@ -19,7 +19,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 ctrlc = "3.5.2"
 sysinfo = "0.38.4"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2.186"
 
 [target.'cfg(windows)'.dependencies]

@@ -26,11 +26,31 @@ use std::time::{Duration, Instant};
 use sysinfo::Networks;
 
 fn main() {
+    restore_default_sigpipe();
     if let Err(error) = run() {
         eprintln!("netor: {error}");
         std::process::exit(1);
     }
 }
+
+/// Restores the default `SIGPIPE` disposition.
+///
+/// Rust ignores `SIGPIPE`, so a closed stdout makes `println!` fail and the
+/// process aborts with a "failed printing to stdout" panic. Since every
+/// subcommand streams output until interrupted, piping into `head` is a
+/// natural thing to do and should end the process quietly, as with any other
+/// Unix filter, instead of printing a panic.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: setting a process-wide signal disposition to its default is
+    // async-signal-safe and happens before any other thread is started.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
 
 fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();

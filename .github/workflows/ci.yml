@@ -6,97 +6,120 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  # Fail rather than silently resolving different dependency versions.
+  CARGO_NET_OFFLINE: "false"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
-    name: Test
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        rust: [stable, nightly]
-    
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
-      
+
       - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      
+        uses: Swatinem/rust-cache@v2
+
       - name: Install Npcap SDK (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile npcap-sdk.zip
           Expand-Archive -Path npcap-sdk.zip -DestinationPath npcap-sdk
-          echo "LIB=${{ github.workspace }}\npcap-sdk\Lib\x64" >> $env:GITHUB_ENV
+          "LIB=${{ github.workspace }}\npcap-sdk\Lib\x64" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Install Npcap (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-1.80.exe" -OutFile npcap.exe
-          Start-Process -FilePath .\npcap.exe -ArgumentList '/S' -Wait
-      
       - name: Check formatting
         run: cargo fmt --all -- --check
-      
-      - name: Clippy (Linux)
-        if: runner.os == 'Linux'
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      
+
+      - name: Clippy
+        if: runner.os != 'Windows'
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
       - name: Clippy (Windows)
         if: runner.os == 'Windows'
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      
-      - name: Clippy (macOS)
-        if: runner.os == 'macOS'
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
-      
-      - name: Run tests (Linux)
-        if: runner.os == 'Linux'
-        run: cargo test --verbose
-      
-      - name: Run tests (Windows)
+        shell: pwsh
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      # The default `npcap` feature is a no-op off Windows, but the
+      # no-default-features build is what a Windows user without the Npcap SDK
+      # compiles, so it must be checked explicitly on every platform.
+      - name: Clippy (no default features)
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+
+      - name: Test
+        if: runner.os != 'Windows'
+        run: cargo test --locked --verbose
+
+      - name: Test (Windows)
         if: runner.os == 'Windows'
-        run: cargo test --verbose
-      
-      - name: Run tests (macOS)
-        if: runner.os == 'macOS'
-        run: cargo test --verbose --no-default-features
-      
-      - name: Build
-        run: cargo build --release --verbose
+        shell: pwsh
+        run: cargo test --locked --verbose
+
+      - name: Test (no default features)
+        run: cargo test --locked --no-default-features
+
+      - name: Build release binary
+        run: cargo build --locked --release --verbose
+
+      # `live` was silently returning nothing on macOS, so the binary is
+      # exercised on every platform. Exit status and the table header are
+      # asserted; a host with no connections is still a success.
+      - name: Smoke test the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=./target/release/netor
+          "$bin" --version
+          "$bin" --help > /dev/null
+          # Output is captured rather than piped so the assertions cannot race
+          # with the producer's exit status.
+          "$bin" --once --all --interval 0.2 > out.txt
+          grep -q "rx/s" out.txt
+          "$bin" live --once > live.txt
+          grep -q "active remote connections" live.txt
+          # `web` needs root, and raw sockets are unavailable in the macOS CI
+          # sandbox, so it is only required to fail cleanly. On Windows
+          # without the Npcap driver it reports a capability message instead.
+          "$bin" web --once --interval 0.2 > web.txt 2>&1 || true
+          grep -qE \
+            "web protocol events|not yet supported|requires the 'npcap' feature|Operation not permitted" \
+            web.txt
+          echo "smoke tests passed"
 
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
-    
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      
+
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
-      
+        uses: taiki-e/install-action@cargo-tarpaulin
+
       - name: Generate coverage
-        run: cargo tarpaulin --out xml --output-dir coverage
-      
+        run: cargo tarpaulin --locked --out xml --output-dir coverage
+
       - name: Upload coverage
         uses: codecov/codecov-action@v4
         with:

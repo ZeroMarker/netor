@@ -21,73 +21,104 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-    
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      
+
+      # Windows builds the Npcap backend, which links against the Npcap SDK.
+      - name: Install Npcap SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile npcap-sdk.zip
+          Expand-Archive -Path npcap-sdk.zip -DestinationPath npcap-sdk
+          "LIB=${{ github.workspace }}\npcap-sdk\Lib\x64" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-      
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
       - name: Package (Unix)
-        if: matrix.os != 'windows-latest'
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../netor-${{ matrix.target }}.tar.gz netor
-          cd ../../..
-      
+          set -euo pipefail
+          cd "target/${{ matrix.target }}/release"
+          tar czf "../../../netor-${{ matrix.target }}.tar.gz" netor
+
+      # Compress-Archive ships with the runner; 7z is not guaranteed to.
       - name: Package (Windows)
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../netor-${{ matrix.target }}.zip netor.exe
-          cd ../../..
-      
+          Compress-Archive -Path "target/${{ matrix.target }}/release/netor.exe" `
+                            -DestinationPath "netor-${{ matrix.target }}.zip"
+
+      - name: Checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum netor-*.* > netor-${{ matrix.target }}.sha256
+          cat netor-${{ matrix.target }}.sha256
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: netor-${{ matrix.target }}
           path: netor-${{ matrix.target }}.*
+          if-no-files-found: error
 
   release:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    
+
     steps:
-      - uses: actions/checkout@v4
-      
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-      
+          merge-multiple: true
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/**/*
-          
+          files: artifacts/*
+
+  # Publishing to crates.io is a side effect that must never invalidate an
+  # already published GitHub release, so failures here are reported but do not
+  # fail the workflow. Re-running a tag whose version is already on crates.io
+  # is therefore a no-op rather than an error.
   publish:
     name: Publish to crates.io
     needs: release
     runs-on: ubuntu-latest
-    
+    continue-on-error: true
+    if: ${{ !contains(github.ref_name, '-') }}
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      
+
       - name: Publish
-        run: cargo publish --token ${{ secrets.CARGO_TOKEN }}
+        run: cargo publish --locked --token ${{ secrets.CARGO_TOKEN }}

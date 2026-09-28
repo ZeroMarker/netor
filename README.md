@@ -78,6 +78,10 @@ Intervals must be positive and representable with nanosecond precision.
 Press Ctrl+C to interrupt monitoring waits; packet capture checks for shutdown
 between packet reads (normally within the 200 ms capture timeout).
 
+All three subcommands stream output, so they can be piped. Closing the pipe
+early, for example with `head`, ends the process quietly rather than raising an
+error.
+
 ## Limits
 
 The operating system connection table usually exposes remote IP addresses and

@@ -353,6 +353,88 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn parses_a_full_macos_netstat_dump() {
+        // Verbatim `netstat -n -p tcp` output from macOS. Before the endpoint
+        // parser learned the BSD `.` separator and the `%scope` suffix, every
+        // one of these lines was dropped and the command always reported an
+        // empty snapshot.
+        let dump = "\
+Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)
+tcp4       0      0  192.168.1.5.54321       93.184.216.34.443      ESTABLISHED
+tcp4       0      0  192.168.1.5.49876       17.253.144.10.443      ESTABLISHED
+tcp46      0      0  *.22                    *.*                    LISTEN
+tcp46      0      0  *.54322                 *.*                    LISTEN
+tcp6       0      0  fe80::1%lo0.49152       fe80::2%lo0.443       ESTABLISHED
+tcp6       0      0  *.54323                 *.*                    LISTEN
+";
+
+        let connections = dump
+            .lines()
+            .filter_map(parse_netstat_line)
+            .collect::<Vec<_>>();
+
+        let established = connections
+            .iter()
+            .filter(|c| c.state == "ESTABLISHED")
+            .count();
+        assert_eq!(established, 3, "got {connections:#?}");
+        assert!(connections.iter().all(|c| !c.remote_ip.is_loopback()));
+        assert!(connections.iter().all(|c| c.remote_port != 0));
+
+        // The wildcard listeners must be dropped rather than reported.
+        assert!(
+            connections.iter().all(|c| !c.remote_ip.is_unspecified()),
+            "wildcard listener leaked: {connections:#?}"
+        );
+
+        assert!(connections.contains(&TcpConnection {
+            remote_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            remote_port: 443,
+            state: "ESTABLISHED".to_owned(),
+        }));
+        assert!(connections.contains(&TcpConnection {
+            remote_ip: IpAddr::V6("fe80::2".parse().unwrap()),
+            remote_port: 443,
+            state: "ESTABLISHED".to_owned(),
+        }));
+    }
+
+    #[test]
+    fn parses_a_full_linux_netstat_dump() {
+        let dump = "\
+Active Internet connections (servers and established)
+Proto Recv-Q Send-Q Local Address           Foreign Address         State
+tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN
+tcp        0      0 127.0.0.1:54321         93.184.216.34:443      ESTABLISHED
+tcp        0      0 10.0.0.5:60123          [2606:2800:220:1:248:1893:25c8:1946]:443 ESTABLISHED
+tcp6       0      0 :::22                   :::*                    LISTEN
+udp        0      0 0.0.0.0:5353            0.0.0.0:*
+";
+
+        let connections = dump
+            .lines()
+            .filter_map(parse_netstat_line)
+            .collect::<Vec<_>>();
+
+        assert_eq!(connections.len(), 2, "got {connections:#?}");
+        assert!(connections.iter().all(|c| c.state == "ESTABLISHED"));
+    }
+
+    #[test]
+    fn collects_connections_on_this_platform() {
+        // Exercises whichever backend this platform selects. A host with no
+        // remote connections is legitimate, but the call must succeed and must
+        // never hand back a loopback or wildcard endpoint.
+        let connections = collect_live_connections(true).expect("connection table readable");
+        for connection in &connections {
+            assert!(!connection.remote_ip.is_loopback());
+            assert!(!connection.remote_ip.is_unspecified());
+            assert_ne!(connection.remote_port, 0);
+        }
+    }
+
+    #[test]
     fn rejects_malformed_linux_proc_addresses() {
         assert_eq!(parse_linux_proc_address(""), None);
         assert_eq!(parse_linux_proc_address("ZZZZ:01BB"), None);
