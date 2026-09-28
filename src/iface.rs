@@ -22,9 +22,13 @@ pub fn collect_interface_rows(
     cli: &NetworkArgs,
     elapsed_secs: f64,
 ) -> Vec<InterfaceRow> {
+    // Lowercase the filter once per sample rather than once per interface,
+    // and match without allocating a lowercase copy of each name.
+    let filter = interface_filter(cli.interface.as_deref());
+
     let mut rows = networks
         .iter()
-        .filter(|(name, _)| matches_interface(name, cli.interface.as_deref()))
+        .filter(|(name, _)| matches_interface(name, filter.as_deref()))
         .filter(|(_, data)| cli.all || data.received() > 0 || data.transmitted() > 0)
         .map(|(name, data)| interface_row_from_network(name, data, elapsed_secs))
         .collect::<Vec<_>>();
@@ -42,10 +46,33 @@ pub fn collect_interface_rows(
     rows
 }
 
-pub fn matches_interface(name: &str, filter: Option<&str>) -> bool {
-    filter
-        .map(|filter| name.to_lowercase().contains(&filter.to_lowercase()))
-        .unwrap_or(true)
+/// Lowercases an interface filter once, ahead of the per-interface scan.
+fn interface_filter(filter: Option<&str>) -> Option<String> {
+    filter.map(|filter| filter.to_ascii_lowercase())
+}
+
+/// Tests `name` against an already lowercased filter.
+///
+/// Matching is ASCII case-insensitive, which covers every interface name the
+/// supported platforms produce, and avoids allocating a lowercase copy of
+/// `name` on every sample.
+fn matches_interface(name: &str, lowered_filter: Option<&str>) -> bool {
+    lowered_filter.is_none_or(|filter| contains_ignore_ascii_case(name, filter))
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+
+    let needle = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 fn interface_row_from_network(name: &str, data: &NetworkData, elapsed_secs: f64) -> InterfaceRow {
@@ -106,9 +133,23 @@ mod tests {
 
     #[test]
     fn filters_interfaces_case_insensitively() {
-        assert!(matches_interface("Ethernet 2", Some("ether")));
-        assert!(!matches_interface("lo", Some("wlan")));
+        let ether = interface_filter(Some("ether"));
+        assert!(matches_interface("Ethernet 2", ether.as_deref()));
+        assert!(matches_interface("ETHERNET 2", ether.as_deref()));
+
+        let wlan = interface_filter(Some("wlan"));
+        assert!(!matches_interface("lo", wlan.as_deref()));
+
         assert!(matches_interface("lo", None));
+    }
+
+    #[test]
+    fn matches_partial_and_empty_filters() {
+        let filter = interface_filter(Some(""));
+        assert!(matches_interface("anything", filter.as_deref()));
+
+        let short = interface_filter(Some("abcdefgh"));
+        assert!(!matches_interface("abc", short.as_deref()));
     }
 
     #[test]

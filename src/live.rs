@@ -3,13 +3,10 @@
 use crate::tally::sorted_counts;
 use std::collections::HashMap;
 use std::error::Error;
+#[cfg(target_os = "linux")]
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command as ProcessCommand;
-
-#[cfg(target_os = "linux")]
-use std::fs::File;
-#[cfg(target_os = "linux")]
-use std::io::{BufRead, BufReader};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TcpConnection {
@@ -45,24 +42,29 @@ fn collect_linux_proc_file(
     all_states: bool,
     connections: &mut Vec<TcpConnection>,
 ) -> Result<(), Box<dyn Error>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    // Read the whole table in one pass and slice it in place. Collecting each
+    // line into a `String` and its fields into a `Vec` would allocate twice
+    // per socket, which is the hot path on a host with many connections.
+    let table = fs::read_to_string(path)?;
 
-    for line in reader.lines().skip(1) {
-        let line = line?;
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() < 4 {
+    for line in table.lines().skip(1) {
+        // Columns are: sl, local_address, rem_address, st, ...
+        let mut fields = line.split_ascii_whitespace();
+        let Some(remote) = fields.nth(2) else {
             continue;
-        }
+        };
+        let Some(state) = fields.next() else {
+            continue;
+        };
 
-        let Some((remote_ip, remote_port)) = parse_linux_proc_address(fields[2]) else {
+        let Some((remote_ip, remote_port)) = parse_linux_proc_address(remote) else {
             continue;
         };
         if remote_ip.is_loopback() || remote_ip.is_unspecified() || remote_port == 0 {
             continue;
         }
 
-        let state = tcp_state_name(fields[3]).to_owned();
+        let state = tcp_state_name(state);
         if !all_states && state != "ESTABLISHED" {
             continue;
         }
@@ -70,7 +72,7 @@ fn collect_linux_proc_file(
         connections.push(TcpConnection {
             remote_ip,
             remote_port,
-            state,
+            state: state.to_owned(),
         });
     }
 
@@ -202,13 +204,16 @@ fn parse_colon_endpoint(value: &str) -> Option<(IpAddr, u16)> {
 }
 
 pub fn print_live_connections(connections: &[TcpConnection], top: usize) {
-    let mut counts = HashMap::new();
+    // Count by borrowed key so that no endpoint string is allocated per row.
+    let mut counts: HashMap<(IpAddr, u16, &str), u64> = HashMap::new();
     for connection in connections {
-        let key = format!(
-            "{}:{} {}",
-            connection.remote_ip, connection.remote_port, connection.state
-        );
-        *counts.entry(key).or_default() += 1;
+        *counts
+            .entry((
+                connection.remote_ip,
+                connection.remote_port,
+                connection.state.as_str(),
+            ))
+            .or_default() += 1;
     }
 
     println!();
@@ -218,8 +223,8 @@ pub fn print_live_connections(connections: &[TcpConnection], top: usize) {
         return;
     }
 
-    for (endpoint, count) in sorted_counts(&counts).into_iter().take(top) {
-        println!("  {:>8} {}", count, endpoint);
+    for ((ip, port, state), count) in sorted_counts(&counts).into_iter().take(top) {
+        println!("  {:>8} {}:{} {}", count, ip, port, state);
     }
 }
 

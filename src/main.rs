@@ -6,6 +6,7 @@
 
 mod capture;
 mod cli;
+mod filter;
 mod format;
 mod iface;
 mod live;
@@ -13,7 +14,7 @@ mod proto;
 mod shutdown;
 mod tally;
 
-use crate::capture::{capture_web_events, print_web_events};
+use crate::capture::{capture_web_events, print_web_events, Capture};
 use crate::cli::{Cli, Command, LiveArgs, NetworkArgs, WebArgs};
 use crate::format::trim_float;
 use crate::iface::{collect_interface_rows, print_interface_rows};
@@ -117,8 +118,12 @@ fn run_web(cli: WebArgs) -> Result<(), Box<dyn Error>> {
         "note: captures DNS queries and TLS SNI from packets; root/CAP_NET_RAW is usually required"
     );
 
+    // The handle is opened once and reused, so no traffic is lost between
+    // windows the way it was when a raw socket was recreated each time.
+    let mut capture = Capture::open(cli.interface.as_deref())?;
+
     loop {
-        let events = capture_web_events(interval, cli.interface.as_deref(), &running)?;
+        let events = capture_web_events(&mut capture, interval, &running)?;
         print_web_events(&events, cli.top);
 
         if cli.once || !running.load(std::sync::atomic::Ordering::SeqCst) {

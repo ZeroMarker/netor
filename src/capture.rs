@@ -1,238 +1,328 @@
 //! Packet capture backends: Linux raw sockets and Windows Npcap.
+//!
+//! A [`Capture`] is opened once and reused for every window. Opening a fresh
+//! raw socket per window would drop everything that arrived while the previous
+//! socket was being torn down and replaced.
 
-use crate::proto::WebEvent;
+use crate::proto::{self, WebEvent};
 use crate::tally::sorted_counts;
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-#[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+/// Size of the receive buffer. Large enough for a full jumbo frame.
+const CAPTURE_BUFFER_LEN: usize = 65_536;
 
-#[cfg(target_os = "linux")]
+/// Collects domain events for one capture window.
 pub fn capture_web_events(
+    capture: &mut Capture,
     duration: Duration,
-    interface: Option<&str>,
     running: &AtomicBool,
 ) -> Result<Vec<WebEvent>, Box<dyn Error>> {
-    let socket = open_packet_socket(interface)?;
-    let started = std::time::Instant::now();
-    let mut buffer = vec![0_u8; 65_536];
+    let started = Instant::now();
+    let mut buffer = vec![0_u8; CAPTURE_BUFFER_LEN];
     let mut events = Vec::new();
 
-    while running.load(std::sync::atomic::Ordering::SeqCst) && started.elapsed() < duration {
-        let read = unsafe {
-            libc::recv(
-                socket.as_raw_fd(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                0,
-            )
-        };
-
+    while running.load(Ordering::SeqCst) && started.elapsed() < duration {
+        let read = capture.read(&mut buffer)?;
         if read > 0 {
-            events.extend(crate::proto::parse_packet_for_web_events(
-                &buffer[..read as usize],
-            ));
-            continue;
+            events.extend(proto::parse_packet_for_web_events(&buffer[..read]));
         }
-
-        let error = std::io::Error::last_os_error();
-        if matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock
-                | std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::Interrupted
-        ) {
-            continue;
-        }
-
-        return Err(error.into());
     }
 
     Ok(events)
 }
 
-#[cfg(all(windows, feature = "npcap"))]
-pub fn capture_web_events(
-    duration: Duration,
-    interface: Option<&str>,
-    running: &AtomicBool,
-) -> Result<Vec<WebEvent>, Box<dyn Error>> {
-    let device = select_pcap_device(interface)?;
-    let mut cap = pcap::Capture::from_device(device)
-        .map_err(|e| format!("pcap: {e}"))?
-        .promisc(true)
-        .snaplen(65_536)
-        .timeout(200)
-        .immediate_mode(true)
-        .open()
-        .map_err(|e| format!("pcap open: {e}"))?;
+#[cfg(target_os = "linux")]
+mod backend {
+    use super::{Error, CAPTURE_BUFFER_LEN};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::time::Duration;
 
-    let started = std::time::Instant::now();
-    let mut events = Vec::new();
+    /// How long a blocking read waits before returning so that the shutdown
+    /// flag can be rechecked.
+    const READ_TIMEOUT: Duration = Duration::from_millis(200);
 
-    while running.load(std::sync::atomic::Ordering::SeqCst) && started.elapsed() < duration {
-        match cap.next_packet() {
-            Ok(packet) => {
-                events.extend(crate::proto::parse_packet_for_web_events(packet.data));
+    pub struct Capture {
+        socket: OwnedFd,
+    }
+
+    impl Capture {
+        pub fn open(interface: Option<&str>) -> Result<Self, Box<dyn Error>> {
+            let protocol = (libc::ETH_P_ALL as u16).to_be() as i32;
+            let socket = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, protocol) };
+            if socket < 0 {
+                return Err(std::io::Error::last_os_error().into());
             }
-            Err(pcap::Error::TimeoutExpired) => continue,
-            Err(e) => return Err(format!("pcap: {e}").into()),
+
+            // Own the descriptor immediately so every error path closes it.
+            let socket = unsafe { OwnedFd::from_raw_fd(socket) };
+            let capture = Capture { socket };
+
+            capture.set_read_timeout(READ_TIMEOUT)?;
+            capture.attach_filter();
+
+            if let Some(interface) = interface {
+                capture.bind(interface)?;
+            }
+
+            Ok(capture)
+        }
+
+        /// Returns the number of bytes read, or 0 if the read timed out.
+        pub fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+            debug_assert!(buffer.len() <= CAPTURE_BUFFER_LEN);
+            let read = unsafe {
+                libc::recv(
+                    self.socket.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    0,
+                )
+            };
+
+            if read >= 0 {
+                return Ok(read as usize);
+            }
+
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+            ) {
+                return Ok(0);
+            }
+            Err(error.into())
+        }
+
+        fn set_read_timeout(&self, timeout: Duration) -> Result<(), Box<dyn Error>> {
+            let value = libc::timeval {
+                tv_sec: timeout.as_secs() as libc::time_t,
+                tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+            };
+            let set = unsafe {
+                libc::setsockopt(
+                    self.socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    (&value as *const libc::timeval).cast(),
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            };
+            if set < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
+        }
+
+        /// Installs a kernel-side BPF filter so that the kernel drops the
+        /// packets `netor` would only discard again in userspace.
+        ///
+        /// This is a load filter, not a correctness filter: anything the
+        /// dissector might still need is let through, and a failure here only
+        /// costs performance, so it is never fatal.
+        fn attach_filter(&self) {
+            let program = crate::filter::INTEREST_FILTER;
+            let length = libc::c_ushort::try_from(program.len()).unwrap_or(libc::c_ushort::MAX);
+            let filter = libc::sock_fprog {
+                len: length,
+                filter: program.as_ptr().cast_mut(),
+            };
+
+            let attached = unsafe {
+                libc::setsockopt(
+                    self.socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_ATTACH_FILTER,
+                    (&filter as *const libc::sock_fprog).cast(),
+                    std::mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+                )
+            };
+            if attached < 0 {
+                eprintln!(
+                    "netor: warning: could not attach the capture filter ({}); \
+                     continuing without it",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        fn bind(&self, interface: &str) -> Result<(), Box<dyn Error>> {
+            let c_interface = std::ffi::CString::new(interface)?;
+            let index = unsafe { libc::if_nametoindex(c_interface.as_ptr()) };
+            if index == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+
+            let address = libc::sockaddr_ll {
+                sll_family: libc::AF_PACKET as u16,
+                sll_protocol: (libc::ETH_P_ALL as u16).to_be(),
+                sll_ifindex: index as i32,
+                sll_hatype: 0,
+                sll_pkttype: 0,
+                sll_halen: 0,
+                sll_addr: [0; 8],
+            };
+
+            let result = unsafe {
+                libc::bind(
+                    self.socket.as_raw_fd(),
+                    (&address as *const libc::sockaddr_ll).cast(),
+                    std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                )
+            };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use backend::Capture;
+
+#[cfg(all(windows, feature = "npcap"))]
+mod backend {
+    use super::Error;
+
+    pub struct Capture {
+        inner: pcap::Capture<pcap::Active>,
+    }
+
+    impl Capture {
+        pub fn open(interface: Option<&str>) -> Result<Self, Box<dyn Error>> {
+            let device = select_pcap_device(interface)?;
+            let inner = pcap::Capture::from_device(device)
+                .map_err(|e| format!("pcap: {e}"))?
+                .promisc(true)
+                .snaplen(super::CAPTURE_BUFFER_LEN as i32)
+                .timeout(200)
+                .immediate_mode(true)
+                .open()
+                .map_err(|e| format!("pcap open: {e}"))?;
+
+            let capture = Capture { inner };
+            capture.attach_filter();
+            Ok(capture)
+        }
+
+        /// Returns the number of bytes read, or 0 if the read timed out.
+        pub fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+            use pcap::ActivatedCapture;
+
+            loop {
+                match self.inner.next_packet() {
+                    Ok(packet) => {
+                        let length = packet.data.len().min(buffer.len());
+                        buffer[..length].copy_from_slice(&packet.data[..length]);
+                        return Ok(length);
+                    }
+                    Err(pcap::Error::TimeoutExpired) => return Ok(0),
+                    Err(error) => return Err(format!("pcap: {error}").into()),
+                }
+            }
+        }
+
+        /// Lets the same kernel-side filter run on Windows via Npcap, so both
+        /// platforms do the same amount of work.
+        fn attach_filter(&self) {
+            if let Err(error) = self.inner.filter(crate::filter::PCAP_FILTER, true) {
+                eprintln!(
+                    "netor: warning: could not apply the capture filter ({error}); \
+                     continuing without it"
+                );
+            }
         }
     }
 
-    Ok(events)
-}
+    fn select_pcap_device(interface: Option<&str>) -> Result<pcap::Device, Box<dyn Error>> {
+        let devices = pcap::Device::list().map_err(|e| format!("pcap device list: {e}"))?;
 
-#[cfg(all(windows, feature = "npcap"))]
-fn select_pcap_device(interface: Option<&str>) -> Result<pcap::Device, Box<dyn Error>> {
-    let devices = pcap::Device::list().map_err(|e| format!("pcap device list: {e}"))?;
+        if let Some(filter) = interface {
+            let filter_lower = filter.to_lowercase();
+            devices
+                .into_iter()
+                .find(|d| {
+                    d.name.to_lowercase().contains(&filter_lower)
+                        || d.desc
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(&filter_lower)
+                })
+                .ok_or_else(|| format!("no network interface matching '{filter}'").into())
+        } else {
+            select_default_device(devices)
+        }
+    }
 
-    if let Some(filter) = interface {
-        let filter_lower = filter.to_lowercase();
-        devices
-            .into_iter()
-            .find(|d| {
-                d.name.to_lowercase().contains(&filter_lower)
-                    || d.desc
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains(&filter_lower)
-            })
-            .ok_or_else(|| format!("no network interface matching '{filter}'").into())
-    } else {
-        select_default_device(devices)
+    fn select_default_device(devices: Vec<pcap::Device>) -> Result<pcap::Device, Box<dyn Error>> {
+        let skip_keywords = [
+            "wan miniport",
+            "loopback",
+            "tunnel",
+            "teredo",
+            "isatap",
+            "bluetooth",
+        ];
+        let prefer_keywords = [
+            "ethernet", "wi-fi", "wireless", "realtek", "intel", "qualcomm",
+        ];
+
+        if let Some(device) = devices.iter().find(|d| {
+            let desc = d.desc.as_deref().unwrap_or("").to_lowercase();
+            prefer_keywords.iter().any(|kw| desc.contains(kw))
+                && !skip_keywords.iter().any(|kw| desc.contains(kw))
+        }) {
+            return Ok(device.clone());
+        }
+
+        if let Some(device) = devices.iter().find(|d| {
+            let desc = d.desc.as_deref().unwrap_or("").to_lowercase();
+            !skip_keywords.iter().any(|kw| desc.contains(kw)) && !d.addresses.is_empty()
+        }) {
+            return Ok(device.clone());
+        }
+
+        pcap::Device::lookup()
+            .map_err(|e| format!("pcap device lookup: {e}"))?
+            .ok_or("no default network interface found".into())
     }
 }
 
 #[cfg(all(windows, feature = "npcap"))]
-fn select_default_device(devices: Vec<pcap::Device>) -> Result<pcap::Device, Box<dyn Error>> {
-    let skip_keywords = [
-        "wan miniport",
-        "loopback",
-        "tunnel",
-        "teredo",
-        "isatap",
-        "bluetooth",
-    ];
-    let prefer_keywords = [
-        "ethernet", "wi-fi", "wireless", "realtek", "intel", "qualcomm",
-    ];
+pub use backend::Capture;
 
-    if let Some(device) = devices.iter().find(|d| {
-        let desc = d.desc.as_deref().unwrap_or("").to_lowercase();
-        prefer_keywords.iter().any(|kw| desc.contains(kw))
-            && !skip_keywords.iter().any(|kw| desc.contains(kw))
-    }) {
-        return Ok(device.clone());
-    }
-
-    if let Some(device) = devices.iter().find(|d| {
-        let desc = d.desc.as_deref().unwrap_or("").to_lowercase();
-        !skip_keywords.iter().any(|kw| desc.contains(kw)) && !d.addresses.is_empty()
-    }) {
-        return Ok(device.clone());
-    }
-
-    pcap::Device::lookup()
-        .map_err(|e| format!("pcap device lookup: {e}"))?
-        .ok_or("no default network interface found".into())
-}
+/// Placeholder for platforms with no capture support, so that `main` and the
+/// CLI stay platform independent and report a clear error.
+#[cfg(not(any(target_os = "linux", all(windows, feature = "npcap"))))]
+pub struct Capture;
 
 #[cfg(not(any(target_os = "linux", all(windows, feature = "npcap"))))]
-pub fn capture_web_events(
-    _duration: Duration,
-    _interface: Option<&str>,
-    _running: &AtomicBool,
-) -> Result<Vec<WebEvent>, Box<dyn Error>> {
-    #[cfg(windows)]
-    {
-        Err("packet capture requires the 'npcap' feature and Npcap installed; rebuild with --features npcap".into())
+impl Capture {
+    pub fn open(_interface: Option<&str>) -> Result<Self, Box<dyn Error>> {
+        #[cfg(windows)]
+        {
+            Err("packet capture requires the 'npcap' feature and Npcap installed; rebuild with --features npcap".into())
+        }
+        #[cfg(not(windows))]
+        {
+            Err("packet capture is not yet supported on this platform".into())
+        }
     }
-    #[cfg(not(windows))]
-    {
-        Err("packet capture is not yet supported on this platform".into())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn open_packet_socket(interface: Option<&str>) -> Result<OwnedFd, Box<dyn Error>> {
-    let protocol = (libc::ETH_P_ALL as u16).to_be() as i32;
-    let socket = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, protocol) };
-    if socket < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-
-    // Own the descriptor immediately so every error path closes it.
-    let socket = unsafe { OwnedFd::from_raw_fd(socket) };
-
-    let timeout = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 200_000,
-    };
-    let set_timeout = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            (&timeout as *const libc::timeval).cast(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if set_timeout < 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(error.into());
-    }
-
-    if let Some(interface) = interface {
-        bind_packet_socket(socket.as_raw_fd(), interface)?;
-    }
-
-    Ok(socket)
-}
-
-#[cfg(target_os = "linux")]
-fn bind_packet_socket(socket: libc::c_int, interface: &str) -> Result<(), Box<dyn Error>> {
-    let c_interface = std::ffi::CString::new(interface)?;
-    let index = unsafe { libc::if_nametoindex(c_interface.as_ptr()) };
-    if index == 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(error.into());
-    }
-
-    let address = libc::sockaddr_ll {
-        sll_family: libc::AF_PACKET as u16,
-        sll_protocol: (libc::ETH_P_ALL as u16).to_be(),
-        sll_ifindex: index as i32,
-        sll_hatype: 0,
-        sll_pkttype: 0,
-        sll_halen: 0,
-        sll_addr: [0; 8],
-    };
-
-    let result = unsafe {
-        libc::bind(
-            socket,
-            (&address as *const libc::sockaddr_ll).cast(),
-            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-        )
-    };
-    if result < 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(error.into());
-    }
-
-    Ok(())
 }
 
 pub fn print_web_events(events: &[WebEvent], top: usize) {
-    let mut counts = HashMap::new();
+    // Count by borrowed key so that no key string is allocated per packet.
+    let mut counts: HashMap<(&str, &str), u64> = HashMap::new();
     for event in events {
-        let key = format!("{} {}", event.source, event.domain);
-        *counts.entry(key).or_default() += 1;
+        *counts
+            .entry((event.source, event.domain.as_str()))
+            .or_default() += 1;
     }
 
     println!();
@@ -242,7 +332,20 @@ pub fn print_web_events(events: &[WebEvent], top: usize) {
         return;
     }
 
-    for (domain, count) in sorted_counts(&counts).into_iter().take(top) {
-        println!("  {:>8} {}", domain, count);
+    for ((source, domain), count) in sorted_counts(&counts).into_iter().take(top) {
+        println!("  {:>8} {} {}", count, source, domain);
     }
 }
+
+/// `sock_filter` is only defined on Linux, so the instruction table is kept
+/// out of the way on other platforms.
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct FilterInstruction {
+    pub code: u16,
+    pub jt: u8,
+    pub jf: u8,
+    pub k: u32,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use libc::sock_filter as FilterInstruction;
