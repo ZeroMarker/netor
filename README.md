@@ -96,6 +96,12 @@ TLS SNI. It will not see domains hidden by encrypted DNS, encrypted ClientHello,
 VPN tunnels, proxies, or already-established connections that began before
 capture started.
 
+`web` parses each packet as it arrives and does not reassemble TCP streams. A
+TLS ClientHello larger than the path MTU is split across segments, and the SNI
+is then missing from every individual segment, so large ClientHellos are not
+always attributed. The same applies to a DNS query split across TCP segments,
+which is uncommon since queries are small.
+
 ## Build
 
 ```bash
