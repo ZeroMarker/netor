@@ -2,6 +2,13 @@
 name = "netor"
 version = "0.1.0"
 edition = "2021"
+description = "System-level network traffic monitor for interface rates, live TCP connections and DNS/TLS SNI domains"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/ZeroMarker/netor"
+homepage = "https://github.com/ZeroMarker/netor"
+keywords = ["network", "monitor", "traffic", "netstat", "pcap"]
+categories = ["command-line-utilities", "network-programming", "os::unix-apis"]
 
 [features]
 default = ["npcap"]

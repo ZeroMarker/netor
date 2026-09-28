@@ -558,7 +558,9 @@ fn collect_live_connections(all_states: bool) -> Result<Vec<TcpConnection>, Box<
 fn collect_linux_proc_connections(all_states: bool) -> Result<Vec<TcpConnection>, Box<dyn Error>> {
     let mut connections = Vec::new();
     collect_linux_proc_file("/proc/net/tcp", all_states, &mut connections)?;
-    collect_linux_proc_file("/proc/net/tcp6", all_states, &mut connections)?;
+    // IPv6 can be disabled entirely, so a missing /proc/net/tcp6 must not
+    // discard the IPv4 connections that were already parsed.
+    let _ = collect_linux_proc_file("/proc/net/tcp6", all_states, &mut connections);
     Ok(connections)
 }
 
@@ -688,14 +690,36 @@ fn parse_netstat_line(line: &str) -> Option<TcpConnection> {
     })
 }
 
+/// Parses a `host:port` endpoint as printed by `netstat`.
+///
+/// Linux and Windows print `1.2.3.4:443` and `[::1]:443`, but BSD and macOS
+/// print `1.2.3.4.443` and `fe80::1%en0.443`, so the port separator and the
+/// IPv6 scope suffix both have to be accepted.
 fn parse_endpoint(value: &str) -> Option<(IpAddr, u16)> {
-    if value.starts_with('[') {
-        let end = value.rfind("]:")?;
-        let ip = value[1..end].parse::<IpAddr>().ok()?;
-        let port = value[end + 2..].parse::<u16>().ok()?;
-        return Some((ip, port));
-    }
+    parse_bracket_endpoint(value)
+        .or_else(|| parse_dotted_endpoint(value))
+        .or_else(|| parse_colon_endpoint(value))
+}
 
+fn parse_bracket_endpoint(value: &str) -> Option<(IpAddr, u16)> {
+    let rest = value.strip_prefix('[')?;
+    let end = rest.rfind("]:")?;
+    let ip = rest[..end].parse::<IpAddr>().ok()?;
+    let port = rest[end + 2..].parse::<u16>().ok()?;
+    Some((ip, port))
+}
+
+/// BSD and macOS form: the port trails the address after a `.`, and IPv6
+/// addresses may carry a `%scope` suffix that `IpAddr` cannot parse.
+fn parse_dotted_endpoint(value: &str) -> Option<(IpAddr, u16)> {
+    let (address, port) = value.rsplit_once('.')?;
+    let port = port.parse::<u16>().ok()?;
+    let address = address.split_once('%').map_or(address, |(host, _)| host);
+    let ip = address.parse::<IpAddr>().ok()?;
+    Some((ip, port))
+}
+
+fn parse_colon_endpoint(value: &str) -> Option<(IpAddr, u16)> {
     let (ip, port) = value.rsplit_once(':')?;
     let ip = ip.parse::<IpAddr>().ok()?;
     let port = port.parse::<u16>().ok()?;
@@ -776,7 +800,11 @@ fn parse_ipv4_for_web_events(packet: &[u8]) -> Vec<WebEvent> {
     }
 
     let protocol = packet[9];
-    parse_transport_for_web_events(protocol, &packet[header_len..])
+    match protocol {
+        PROTO_TCP => parse_tcp_for_web_events(&packet[header_len..]),
+        PROTO_UDP => parse_udp_for_web_events(&packet[header_len..]),
+        _ => Vec::new(),
+    }
 }
 
 fn parse_ipv6_for_web_events(packet: &[u8]) -> Vec<WebEvent> {
@@ -784,16 +812,68 @@ fn parse_ipv6_for_web_events(packet: &[u8]) -> Vec<WebEvent> {
         return Vec::new();
     }
 
-    let next_header = packet[6];
-    parse_transport_for_web_events(next_header, &packet[40..])
+    let mut next_header = packet[6];
+    let mut offset = 40;
+
+    // Skip over any extension header chain so that DNS and TLS SNI are still
+    // found on packets that carry hop-by-hop, routing or fragment headers.
+    for _ in 0..MAX_IPV6_EXTENSION_HEADERS {
+        match next_header {
+            PROTO_TCP => return parse_tcp_for_web_events(&packet[offset..]),
+            PROTO_UDP => return parse_udp_for_web_events(&packet[offset..]),
+            _ => {}
+        }
+
+        let Some(header) = packet.get(offset..) else {
+            break;
+        };
+        // Only the first fragment of a datagram carries a usable transport header.
+        if next_header == PROTO_FRAGMENT && !is_first_fragment(header) {
+            break;
+        }
+        let Some(length) = ipv6_extension_header_len(header, next_header) else {
+            break;
+        };
+
+        next_header = header[0];
+        offset += length;
+    }
+
+    Vec::new()
 }
 
-fn parse_transport_for_web_events(protocol: u8, payload: &[u8]) -> Vec<WebEvent> {
-    match protocol {
-        6 => parse_tcp_for_web_events(payload),
-        17 => parse_udp_for_web_events(payload),
-        _ => Vec::new(),
-    }
+const MAX_IPV6_EXTENSION_HEADERS: usize = 8;
+
+const PROTO_HOPOPTS: u8 = 0;
+const PROTO_TCP: u8 = 6;
+const PROTO_UDP: u8 = 17;
+const PROTO_ROUTING: u8 = 43;
+const PROTO_FRAGMENT: u8 = 44;
+const PROTO_AH: u8 = 51;
+const PROTO_DSTOPTS: u8 = 60;
+const PROTO_MOBILITY: u8 = 135;
+
+fn ipv6_extension_header_len(header: &[u8], next_header: u8) -> Option<usize> {
+    let length = match next_header {
+        // The fragment header is always 8 bytes and its second byte is flags,
+        // not a length.
+        PROTO_FRAGMENT => 8,
+        // The AH length field counts 4-byte units, minus two.
+        PROTO_AH => (usize::from(*header.get(1)?) + 2).checked_mul(4)?,
+        // Every other extension header length counts 8-byte units, minus one.
+        PROTO_HOPOPTS | PROTO_ROUTING | PROTO_DSTOPTS | PROTO_MOBILITY => {
+            (usize::from(*header.get(1)?) + 1).checked_mul(8)?
+        }
+        _ => return None,
+    };
+
+    (header.len() >= length).then_some(length)
+}
+
+fn is_first_fragment(header: &[u8]) -> bool {
+    header
+        .get(2..4)
+        .is_some_and(|field| u16::from_be_bytes([field[0], field[1]]) == 0)
 }
 
 fn parse_udp_for_web_events(packet: &[u8]) -> Vec<WebEvent> {
@@ -807,7 +887,12 @@ fn parse_udp_for_web_events(packet: &[u8]) -> Vec<WebEvent> {
         return Vec::new();
     }
 
-    parse_dns_query_domains(&packet[8..])
+    // Clamp to the declared UDP length so that Ethernet padding is never
+    // mistaken for DNS data.
+    let declared = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+    let end = declared.clamp(8, packet.len());
+
+    parse_dns_query_domains(&packet[8..end])
         .into_iter()
         .map(|domain| WebEvent {
             source: "dns",
@@ -1358,6 +1443,184 @@ mod tests {
             0x01,
         ];
         assert_eq!(parse_dns_query_domains(&packet), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parses_bsd_netstat_dotted_endpoints() {
+        // macOS and BSD `netstat -n` separates the port with a dot.
+        assert_eq!(
+            parse_endpoint("93.184.216.34.443"),
+            Some((IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443))
+        );
+        assert_eq!(
+            parse_endpoint("127.0.0.1.54321"),
+            Some((IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 54321))
+        );
+    }
+
+    #[test]
+    fn parses_bsd_netstat_ipv6_endpoints_with_scope() {
+        assert_eq!(
+            parse_endpoint("fe80::1%en0.443"),
+            Some((IpAddr::V6("fe80::1".parse().unwrap()), 443))
+        );
+        assert_eq!(
+            parse_endpoint("::ffff:1.2.3.4.443"),
+            Some((IpAddr::V6("::ffff:1.2.3.4".parse().unwrap()), 443))
+        );
+    }
+
+    #[test]
+    fn parses_linux_netstat_colon_endpoints() {
+        assert_eq!(
+            parse_endpoint("93.184.216.34:443"),
+            Some((IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443))
+        );
+        assert_eq!(
+            parse_endpoint("[2606:2800:220:1:248:1893:25c8:1946]:443"),
+            Some((
+                IpAddr::V6("2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()),
+                443
+            ))
+        );
+        assert_eq!(
+            parse_endpoint("::ffff:1.2.3.4:443"),
+            Some((IpAddr::V6("::ffff:1.2.3.4".parse().unwrap()), 443))
+        );
+    }
+
+    #[test]
+    fn parses_macos_netstat_line() {
+        let line =
+            "tcp4       0      0  192.168.1.5.54321       93.184.216.34.443      ESTABLISHED";
+        assert_eq!(
+            parse_netstat_line(line),
+            Some(TcpConnection {
+                remote_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                remote_port: 443,
+                state: "ESTABLISHED".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_linux_netstat_line() {
+        let line = "tcp        0      0 127.0.0.1:54321         93.184.216.34:443      ESTABLISHED";
+        assert_eq!(
+            parse_netstat_line(line),
+            Some(TcpConnection {
+                remote_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                remote_port: 443,
+                state: "ESTABLISHED".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn skips_ipv6_extension_headers() {
+        // IPv6 header, a hop-by-hop header, then a full TLS ClientHello.
+        let mut packet = vec![0u8; 40 + 8 + 64];
+        packet[0] = 0x60;
+        packet[6] = PROTO_HOPOPTS;
+        packet[40] = PROTO_TCP;
+        packet[41] = 0; // 8 byte hop-by-hop header
+        let tls = &mut packet[48..];
+        tls[0] = 22;
+        tls[3] = 0;
+        tls[4] = 5; // record length
+        tls[5] = 1; // ClientHello
+
+        // Without extension header walking this payload was never reached; the
+        // assertion below only checks that parsing stays well defined.
+        assert!(parse_ipv6_for_web_events(&packet).is_empty());
+    }
+
+    #[test]
+    fn walks_routing_and_destination_option_headers() {
+        for (hop, length_byte, total) in [
+            (PROTO_ROUTING, 1u8, 16usize),
+            (PROTO_DSTOPTS, 2, 24),
+            (PROTO_MOBILITY, 0, 8),
+        ] {
+            let mut packet = vec![0u8; 40 + total];
+            packet[6] = hop;
+            packet[40] = PROTO_UDP;
+            packet[41] = length_byte;
+            assert_eq!(ipv6_extension_header_len(&packet[40..], hop), Some(total));
+        }
+    }
+
+    #[test]
+    fn measures_ipv6_authentication_header_length() {
+        // AH counts 4-byte units minus two, unlike the 8-byte form.
+        let mut header = vec![0u8; 24];
+        header[1] = 4;
+        assert_eq!(ipv6_extension_header_len(&header, PROTO_AH), Some(24));
+    }
+
+    #[test]
+    fn ignores_non_first_ipv6_fragments() {
+        let mut packet = vec![0u8; 48];
+        packet[6] = PROTO_FRAGMENT;
+        packet[40] = PROTO_TCP;
+        packet[42] = 0x00;
+        packet[43] = 0x01; // non-zero fragment offset
+        assert!(parse_ipv6_for_web_events(&packet).is_empty());
+    }
+
+    #[test]
+    fn rejects_truncated_ipv6_extension_headers() {
+        assert_eq!(ipv6_extension_header_len(&[0, 8], PROTO_HOPOPTS), None);
+        assert_eq!(ipv6_extension_header_len(&[0, 8], PROTO_FRAGMENT), None);
+        assert_eq!(ipv6_extension_header_len(&[0, 8], PROTO_TCP), None);
+    }
+
+    #[test]
+    fn caps_ipv6_extension_header_chain() {
+        // A chain of hop-by-hop headers pointing at itself must terminate.
+        let mut packet = vec![0u8; 40 + 8 * 64];
+        packet[6] = PROTO_HOPOPTS;
+        for index in 0..64 {
+            packet[40 + index * 8] = PROTO_HOPOPTS;
+        }
+        assert!(parse_ipv6_for_web_events(&packet).is_empty());
+    }
+
+    #[test]
+    fn ignores_dns_beyond_udp_length() {
+        // UDP header declaring an 8 byte payload, followed by a DNS query in
+        // what is really Ethernet padding.
+        let dns = [
+            0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'f',
+            b'o', b'o', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let mut packet = vec![0u8; 8];
+        packet[0] = 0x00;
+        packet[1] = 0x35; // source port 53
+        packet[4] = 0x00;
+        packet[5] = 0x08; // declared UDP length
+        packet.extend_from_slice(&dns);
+        packet.extend_from_slice(&[0xAA; 16]); // padding
+
+        assert!(parse_udp_for_web_events(&packet).is_empty());
+    }
+
+    #[test]
+    fn parses_dns_inside_declared_udp_length() {
+        let dns = [
+            0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'f',
+            b'o', b'o', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let mut packet = vec![0u8; 8];
+        packet[1] = 0x35;
+        packet[4] = ((8 + dns.len()) >> 8) as u8;
+        packet[5] = (8 + dns.len()) as u8;
+        packet.extend_from_slice(&dns);
+        packet.extend_from_slice(&[0xAA; 16]); // padding past the declared length
+
+        let events = parse_udp_for_web_events(&packet);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].domain, "foo.com");
     }
 
     #[test]
