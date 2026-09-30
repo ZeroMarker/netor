@@ -86,6 +86,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The npcap-enabled binary links against wpcap.dll, which exists
+          # only once the Npcap driver is installed; without it the process
+          # cannot even be loaded and bash reports 127 before any output.
+          # Linking that build is what "Build release binary" already proved,
+          # so the runnable build on Windows is the one without the feature.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cargo build --locked --release --no-default-features
+          fi
           bin=./target/release/netor
           "$bin" --version
           "$bin" --help > /dev/null
@@ -96,8 +104,9 @@ jobs:
           "$bin" live --once > live.txt
           grep -q "active remote connections" live.txt
           # `web` needs root, and raw sockets are unavailable in the macOS CI
-          # sandbox, so it is only required to fail cleanly. On Windows
-          # without the Npcap driver it reports a capability message instead.
+          # sandbox, so it is only required to fail cleanly. On Windows the
+          # smoke-tested build has no Npcap backend, so it reports a
+          # capability message instead.
           "$bin" web --once --interval 0.2 > web.txt 2>&1 || true
           grep -qE \
             "web protocol events|not yet supported|requires the 'npcap' feature|Operation not permitted" \
