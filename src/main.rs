@@ -6,6 +6,7 @@
 
 mod capture;
 mod cli;
+#[cfg(any(target_os = "linux", test))]
 mod filter;
 mod format;
 mod iface;

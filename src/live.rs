@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::error::Error;
 #[cfg(target_os = "linux")]
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
+#[cfg(any(target_os = "linux", test))]
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command as ProcessCommand;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,7 +81,9 @@ fn collect_linux_proc_file(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+/// Parsing is pure, so the tests exercise it on every platform even though
+/// only the Linux backend calls it.
+#[cfg(any(target_os = "linux", test))]
 fn parse_linux_proc_address(value: &str) -> Option<(IpAddr, u16)> {
     let (address, port) = value.split_once(':')?;
     let port = u16::from_str_radix(port, 16).ok()?;
@@ -102,6 +106,9 @@ fn parse_linux_proc_address(value: &str) -> Option<(IpAddr, u16)> {
     }
 }
 
+/// Only the `/proc/net/tcp` backend reads these hex codes, but the mapping is
+/// platform-independent, so the tests run it everywhere.
+#[cfg(any(target_os = "linux", test))]
 pub fn tcp_state_name(hex_state: &str) -> &'static str {
     match hex_state {
         "01" => "ESTABLISHED",
@@ -147,13 +154,12 @@ pub fn parse_netstat_line(line: &str) -> Option<TcpConnection> {
         return None;
     }
 
-    let (remote, state) = if cfg!(windows) {
-        (*fields.get(2)?, *fields.get(3).unwrap_or(&"UNKNOWN"))
-    } else if fields.len() >= 6 {
-        (*fields.get(4)?, *fields.get(5).unwrap_or(&"UNKNOWN"))
-    } else {
-        (*fields.get(2)?, *fields.get(3).unwrap_or(&"UNKNOWN"))
-    };
+    // Windows omits Recv-Q and Send-Q, so the column positions differ by
+    // platform; choose them by shape rather than by `cfg!(windows)` so that
+    // a sample captured on one platform parses on every other one.
+    let (remote_index, state_index) = netstat_columns(&fields);
+    let remote = *fields.get(remote_index)?;
+    let state = *fields.get(state_index).unwrap_or(&"UNKNOWN");
 
     let (remote_ip, remote_port) = parse_endpoint(remote)?;
     if remote_ip.is_loopback() || remote_ip.is_unspecified() || remote_port == 0 {
@@ -165,6 +171,23 @@ pub fn parse_netstat_line(line: &str) -> Option<TcpConnection> {
         remote_port,
         state: state.to_ascii_uppercase(),
     })
+}
+
+/// Picks the foreign-address and state columns out of a `netstat` row.
+///
+/// Linux, BSD and macOS print `Recv-Q` and `Send-Q` before the addresses, so
+/// the foreign address is field 4 and the state is field 5. Windows omits
+/// those columns, putting the foreign address at 2 and the state at 3,
+/// followed by the PID when `-o` is used. The wide layout is tried first and
+/// rejected whenever field 4 is not an endpoint — which is exactly what a
+/// Windows PID column looks like — so both layouts are decided by the row
+/// itself rather than by the platform the binary was built for.
+fn netstat_columns(fields: &[&str]) -> (usize, usize) {
+    if fields.len() >= 6 && parse_endpoint(fields[4]).is_some() {
+        return (4, 5);
+    }
+
+    (2, 3)
 }
 
 /// Parses a `host:port` endpoint as printed by `netstat`.
@@ -321,6 +344,58 @@ mod tests {
             parse_netstat_line("tcp4  0  0  127.0.0.1.54321  127.0.0.1.54322  ESTABLISHED"),
             None
         );
+    }
+
+    #[test]
+    fn parses_windows_netstat_line() {
+        // `netstat -ano` on Windows: no Recv-Q/Send-Q columns, PID last.
+        let line = "  TCP    10.0.0.5:54321         93.184.216.34:443      ESTABLISHED     4128";
+        assert_eq!(
+            parse_netstat_line(line),
+            Some(TcpConnection {
+                remote_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                remote_port: 443,
+                state: "ESTABLISHED".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_a_full_windows_netstat_dump() {
+        let dump = "\
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    127.0.0.1:135          0.0.0.0:0              LISTENING       1048
+  TCP    [::]:445               [::]:0                 LISTENING       4
+  TCP    10.0.0.5:54321         93.184.216.34:443      ESTABLISHED     4128
+  TCP    10.0.0.5:54322         17.253.144.10:443      ESTABLISHED     4128
+  TCP    10.0.0.5:54325         151.101.1.6:443        TIME_WAIT       0
+  UDP    0.0.0.0:5353           *:*                    2180
+";
+
+        let connections = dump
+            .lines()
+            .filter_map(parse_netstat_line)
+            .collect::<Vec<_>>();
+
+        // Both wildcard listeners and the UDP row are dropped, and the PID
+        // column must never be mistaken for a remote endpoint.
+        assert_eq!(connections.len(), 3, "got {connections:#?}");
+        assert!(connections.iter().all(|c| !c.remote_ip.is_unspecified()));
+        assert!(connections.iter().all(|c| c.remote_port != 0));
+        assert_eq!(
+            connections
+                .iter()
+                .filter(|c| c.state == "ESTABLISHED")
+                .count(),
+            2
+        );
+        assert!(connections.contains(&TcpConnection {
+            remote_ip: IpAddr::V4(Ipv4Addr::new(151, 101, 1, 6)),
+            remote_port: 443,
+            state: "TIME_WAIT".to_owned(),
+        }));
     }
 
     #[test]

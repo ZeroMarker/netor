@@ -2,8 +2,11 @@
 //!
 //! Without a filter, `netor` receives and dissects every frame on the wire.
 //! The program below is a classic BPF filter installed with `SO_ATTACH_FILTER`
-//! (Linux) or compiled from an equivalent expression (Windows), so the kernel
-//! can discard traffic that `netor` would only throw away anyway.
+//! so the kernel can discard traffic that `netor` would only throw away
+//! anyway. The instructions are attached on Linux only; the module is
+//! compiled on every platform — on the others only under `cfg(test)` — so the
+//! program itself is tested everywhere, while the Npcap backend on Windows
+//! compiles an equivalent tcpdump expression instead.
 //!
 //! This is deliberately a *load* filter and not a correctness filter. The
 //! dissector in `proto` remains the authority, so the program errs towards
@@ -85,11 +88,6 @@ const REJECT_INDEX: usize = 31;
 /// Index of the instruction that accepts.
 #[cfg(test)]
 const ACCEPT_INDEX: usize = 32;
-
-/// The equivalent tcpdump expression for [`INTEREST_FILTER`], used where a
-/// filter is compiled from a string rather than installed as instructions.
-#[cfg(all(windows, feature = "npcap"))]
-pub const PCAP_FILTER: &str = "(tcp or udp) and (port 53 or port 443)";
 
 /// Classic BPF program: TCP or UDP with port 53 or 443 on IPv4 or IPv6.
 pub const INTEREST_FILTER: &[FilterInstruction] = &[

@@ -189,6 +189,12 @@ pub use backend::Capture;
 mod backend {
     use super::Error;
 
+    /// The tcpdump expression equivalent to the classic BPF program in
+    /// `crate::filter`: Npcap compiles a filter from a string instead of from
+    /// instructions, so this spelling of "port 53 or 443 over TCP or UDP"
+    /// lives next to the backend that needs it.
+    const PCAP_FILTER: &str = "(tcp or udp) and (port 53 or port 443)";
+
     pub struct Capture {
         inner: pcap::Capture<pcap::Active>,
     }
@@ -205,32 +211,28 @@ mod backend {
                 .open()
                 .map_err(|e| format!("pcap open: {e}"))?;
 
-            let capture = Capture { inner };
+            let mut capture = Capture { inner };
             capture.attach_filter();
             Ok(capture)
         }
 
         /// Returns the number of bytes read, or 0 if the read timed out.
         pub fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Box<dyn Error>> {
-            use pcap::ActivatedCapture;
-
-            loop {
-                match self.inner.next_packet() {
-                    Ok(packet) => {
-                        let length = packet.data.len().min(buffer.len());
-                        buffer[..length].copy_from_slice(&packet.data[..length]);
-                        return Ok(length);
-                    }
-                    Err(pcap::Error::TimeoutExpired) => return Ok(0),
-                    Err(error) => return Err(format!("pcap: {error}").into()),
+            match self.inner.next_packet() {
+                Ok(packet) => {
+                    let length = packet.data.len().min(buffer.len());
+                    buffer[..length].copy_from_slice(&packet.data[..length]);
+                    Ok(length)
                 }
+                Err(pcap::Error::TimeoutExpired) => Ok(0),
+                Err(error) => Err(format!("pcap: {error}").into()),
             }
         }
 
         /// Lets the same kernel-side filter run on Windows via Npcap, so both
         /// platforms do the same amount of work.
-        fn attach_filter(&self) {
-            if let Err(error) = self.inner.filter(crate::filter::PCAP_FILTER, true) {
+        fn attach_filter(&mut self) {
+            if let Err(error) = self.inner.filter(PCAP_FILTER, true) {
                 eprintln!(
                     "netor: warning: could not apply the capture filter ({error}); \
                      continuing without it"
@@ -314,6 +316,12 @@ impl Capture {
             Err("packet capture is not yet supported on this platform".into())
         }
     }
+
+    /// Present only so the platform-independent capture loop type-checks;
+    /// [`Capture::open`] fails first, so this is never reached.
+    pub fn read(&mut self, _buffer: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+        Err("packet capture is unavailable on this platform".into())
+    }
 }
 
 pub fn print_web_events(events: &[WebEvent], top: usize) {
@@ -338,8 +346,9 @@ pub fn print_web_events(events: &[WebEvent], top: usize) {
 }
 
 /// `sock_filter` is only defined on Linux, so the instruction table is kept
-/// out of the way on other platforms.
-#[cfg(not(target_os = "linux"))]
+/// out of the way on other platforms. The tests for that table run on every
+/// platform, so they get a stand-in with the same layout.
+#[cfg(all(not(target_os = "linux"), test))]
 pub(crate) struct FilterInstruction {
     pub code: u16,
     pub jt: u8,
