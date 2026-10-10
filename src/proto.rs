@@ -87,9 +87,22 @@ pub fn parse_ipv4_for_web_events(packet: &[u8]) -> Vec<WebEvent> {
         return Vec::new();
     }
 
+    // Only the first fragment carries a transport header.
+    if u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff != 0 {
+        return Vec::new();
+    }
+
+    // Trust the declared total length, but never read past what was captured.
+    // A total length smaller than the header is malformed.
+    let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    if total_len < header_len {
+        return Vec::new();
+    }
+    let payload = &packet[header_len..total_len.min(packet.len())];
+
     match packet[9] {
-        PROTO_TCP => parse_tcp_for_web_events(&packet[header_len..]),
-        PROTO_UDP => parse_udp_for_web_events(&packet[header_len..]),
+        PROTO_TCP => parse_tcp_for_web_events(payload),
+        PROTO_UDP => parse_udp_for_web_events(payload),
         _ => Vec::new(),
     }
 }
@@ -149,7 +162,21 @@ fn ipv6_extension_header_len(header: &[u8], next_header: u8) -> Option<usize> {
 fn is_first_fragment(header: &[u8]) -> bool {
     header
         .get(2..4)
-        .is_some_and(|field| u16::from_be_bytes([field[0], field[1]]) == 0)
+        .is_some_and(|field| u16::from_be_bytes([field[0], field[1]]) & 0xfff8 == 0)
+}
+
+/// Domain names come straight off the wire, so control characters (newlines,
+/// ANSI escapes) are escaped before they can reach a terminal.
+fn escape_control(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 pub fn parse_udp_for_web_events(packet: &[u8]) -> Vec<WebEvent> {
@@ -289,7 +316,9 @@ pub fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize
         if end > packet.len() {
             return None;
         }
-        labels.push(String::from_utf8_lossy(&packet[start..end]).to_string());
+        labels.push(escape_control(&String::from_utf8_lossy(
+            &packet[start..end],
+        )));
         offset = end;
     }
 
@@ -388,9 +417,9 @@ pub fn parse_tls_sni_extension(extension: &[u8]) -> Option<String> {
         }
 
         if name_type == 0 {
-            return Some(
-                String::from_utf8_lossy(&extension[offset..name_end]).to_ascii_lowercase(),
-            );
+            return Some(escape_control(
+                &String::from_utf8_lossy(&extension[offset..name_end]).to_ascii_lowercase(),
+            ));
         }
 
         offset = name_end;
@@ -729,8 +758,71 @@ mod tests {
         packet[6] = PROTO_FRAGMENT;
         packet[40] = PROTO_TCP;
         packet[42] = 0x00;
-        packet[43] = 0x01; // non-zero fragment offset
+        packet[43] = 0x08; // non-zero fragment offset
         assert!(parse_ipv6_for_web_events(&packet).is_empty());
+    }
+
+    #[test]
+    fn keeps_ipv6_first_fragments_with_more_fragments_set() {
+        let dns = udp_over_ipv4(&udp_dns(&["example.com"], 1));
+        let udp = &dns[ETH_HEADER_LEN + IPV4_MIN_HEADER..];
+        for flags in [0x0000u16, 0x0001] {
+            let mut packet = vec![0u8; IPV6_HEADER_LEN];
+            packet[6] = PROTO_FRAGMENT;
+            packet.extend_from_slice(&[PROTO_UDP, 0]);
+            packet.extend_from_slice(&flags.to_be_bytes());
+            packet.extend_from_slice(&[0; 4]);
+            packet.extend_from_slice(udp);
+            assert_eq!(parse_ipv6_for_web_events(&packet).len(), 1, "flags {flags}");
+        }
+    }
+
+    #[test]
+    fn ipv4_ignores_non_first_fragments_and_trailing_data() {
+        let frame = udp_over_ipv4(&udp_dns(&["example.com"], 1));
+        let ip = &frame[ETH_HEADER_LEN..];
+        assert_eq!(parse_ipv4_for_web_events(ip).len(), 1);
+
+        let mut fragment = ip.to_vec();
+        fragment[6] = 0x00;
+        fragment[7] = 0x08;
+        assert!(parse_ipv4_for_web_events(&fragment).is_empty());
+
+        // MF set with offset zero is still a first fragment.
+        let mut first = ip.to_vec();
+        first[6] = 0x20;
+        assert_eq!(parse_ipv4_for_web_events(&first).len(), 1);
+
+        // A DNS query hidden beyond the declared total length is ignored.
+        let mut short = ip.to_vec();
+        short[2..4].copy_from_slice(&((IPV4_MIN_HEADER + UDP_HEADER_LEN) as u16).to_be_bytes());
+        assert!(parse_ipv4_for_web_events(&short).is_empty());
+
+        // Total length below the header length is malformed.
+        let mut bad = ip.to_vec();
+        bad[2..4].copy_from_slice(&10u16.to_be_bytes());
+        assert!(parse_ipv4_for_web_events(&bad).is_empty());
+    }
+
+    #[test]
+    fn escapes_control_characters_in_names() {
+        let mut packet = vec![0u8; DNS_HEADER_LEN];
+        packet[5] = 1;
+        let label = b"a\x1b[2Jb\nc";
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label);
+        packet.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let domains = parse_dns_query_domains(&packet);
+        assert_eq!(domains, vec!["a\\u{1b}[2jb\\nc".to_string()]);
+
+        let mut ext = Vec::new();
+        let name = b"ev\nil.com";
+        ext.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
+        ext.push(0);
+        ext.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        ext.extend_from_slice(name);
+        assert_eq!(parse_tls_sni_extension(&ext).unwrap(), "ev\\nil.com");
+        assert_eq!(escape_control("example.com"), "example.com");
     }
 
     #[test]
