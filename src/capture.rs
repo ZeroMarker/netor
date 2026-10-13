@@ -36,7 +36,7 @@ pub fn capture_web_events(
 
 #[cfg(target_os = "linux")]
 mod backend {
-    use super::{Error, CAPTURE_BUFFER_LEN};
+    use super::{is_loopback_echo, Error, CAPTURE_BUFFER_LEN};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::time::Duration;
 
@@ -70,19 +70,28 @@ mod backend {
             Ok(capture)
         }
 
-        /// Returns the number of bytes read, or 0 if the read timed out.
+        /// Returns the number of bytes read, or 0 if the read timed out or
+        /// the frame was a duplicate that should not be counted.
         pub fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Box<dyn Error>> {
             debug_assert!(buffer.len() <= CAPTURE_BUFFER_LEN);
+            // SAFETY: an all-zero `sockaddr_ll` is a valid value.
+            let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            let mut address_len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
             let read = unsafe {
-                libc::recv(
+                libc::recvfrom(
                     self.socket.as_raw_fd(),
                     buffer.as_mut_ptr().cast(),
                     buffer.len(),
                     0,
+                    (&mut address as *mut libc::sockaddr_ll).cast(),
+                    &mut address_len,
                 )
             };
 
             if read >= 0 {
+                if is_loopback_echo(address.sll_hatype, address.sll_pkttype) {
+                    return Ok(0);
+                }
                 return Ok(read as usize);
             }
 
@@ -180,6 +189,14 @@ mod backend {
             Ok(())
         }
     }
+}
+
+/// A packet sent over loopback is delivered to a packet socket twice: once
+/// as outgoing and once as incoming. Only the incoming copy is kept, so a
+/// query to a local resolver such as `127.0.0.53` is counted once.
+#[cfg(target_os = "linux")]
+fn is_loopback_echo(hatype: u16, pkttype: u8) -> bool {
+    hatype == libc::ARPHRD_LOOPBACK && pkttype == libc::PACKET_OUTGOING
 }
 
 #[cfg(target_os = "linux")]
@@ -358,3 +375,18 @@ pub(crate) struct FilterInstruction {
 
 #[cfg(target_os = "linux")]
 pub(crate) use libc::sock_filter as FilterInstruction;
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::is_loopback_echo;
+
+    #[test]
+    fn drops_only_the_outgoing_loopback_copy() {
+        assert!(is_loopback_echo(
+            libc::ARPHRD_LOOPBACK,
+            libc::PACKET_OUTGOING
+        ));
+        assert!(!is_loopback_echo(libc::ARPHRD_LOOPBACK, libc::PACKET_HOST));
+        assert!(!is_loopback_echo(libc::ARPHRD_ETHER, libc::PACKET_OUTGOING));
+    }
+}

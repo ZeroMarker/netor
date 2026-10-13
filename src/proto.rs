@@ -112,6 +112,15 @@ pub fn parse_ipv6_for_web_events(packet: &[u8]) -> Vec<WebEvent> {
         return Vec::new();
     }
 
+    // Clamp to the declared payload length so trailing link-layer bytes are
+    // never parsed. A zero length marks a jumbogram, which keeps the capture.
+    let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+    let packet = if payload_len == 0 {
+        packet
+    } else {
+        &packet[..(IPV6_HEADER_LEN + payload_len).min(packet.len())]
+    };
+
     let mut next_header = packet[6];
     let mut offset = IPV6_HEADER_LEN;
 
@@ -564,6 +573,10 @@ mod tests {
         udp
     }
 
+    fn dns_or_sni(events: &[WebEvent]) -> Vec<&str> {
+        events.iter().map(|event| event.domain.as_str()).collect()
+    }
+
     fn dns_domains(events: &[WebEvent]) -> Vec<String> {
         events
             .iter()
@@ -727,6 +740,28 @@ mod tests {
         let events = parse_ipv6_for_web_events(&packet);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].domain, "ipv6.example.com");
+    }
+
+    #[test]
+    fn limits_ipv6_to_declared_payload_length() {
+        let tcp = tcp_segment(51000, TLS_PORT, &client_hello("bounded.example.com"));
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x60;
+        packet[6] = PROTO_TCP;
+        packet.extend_from_slice(&tcp);
+
+        // Exact length: the trailing bytes after it are ignored.
+        packet[4..6].copy_from_slice(&(tcp.len() as u16).to_be_bytes());
+        let mut padded = packet.clone();
+        padded.extend_from_slice(&[0xff; 16]);
+        assert_eq!(
+            dns_or_sni(&parse_ipv6_for_web_events(&padded)),
+            ["bounded.example.com"]
+        );
+
+        // A declared length that cuts the ClientHello short hides it.
+        packet[4..6].copy_from_slice(&((tcp.len() - 1) as u16).to_be_bytes());
+        assert_eq!(parse_ipv6_for_web_events(&packet), Vec::<WebEvent>::new());
     }
 
     #[test]
